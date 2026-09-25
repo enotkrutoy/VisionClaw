@@ -27,14 +27,15 @@ jobs:
                      -sdk iphoneos \
                      -destination 'generic/platform=iOS' \
                      -configuration Release \
-                     CODE_SIGNING_ALLOWED=YES \
-                     CODE_SIGNING_REQUIRED=YES \
-                     CODE_SIGN_IDENTITY="-" \
+                     CODE_SIGNING_ALLOWED=NO \
+                     CODE_SIGNING_REQUIRED=NO \
+                     CODE_SIGN_IDENTITY="" \
                      CODE_SIGN_ENTITLEMENTS="" \
                      PROVISIONING_PROFILE_SPECIFIER="" \
                      DEVELOPMENT_TEAM="" \
                      CODE_SIGN_STYLE=Manual \
                      ENABLE_USER_SCRIPT_SANDBOXING=NO \
+                     ENTITLEMENTS_REQUIRED=NO \
                      -derivedDataPath build
 
       - name: Create IPA Package
