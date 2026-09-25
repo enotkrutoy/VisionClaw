@@ -18,21 +18,20 @@ jobs:
           cd samples/CameraAccess
           xcodebuild -resolvePackageDependencies -project CameraAccess.xcodeproj -scheme CameraAccess
 
-      - name: Build Xcode Project
+      - name: Clean and Build Xcode Project
         run: |
           cd samples/CameraAccess
-          xcodebuild build \
+          xcodebuild clean build \
                      -project CameraAccess.xcodeproj \
                      -scheme CameraAccess \
                      -sdk iphoneos \
                      -destination 'generic/platform=iOS' \
                      -configuration Release \
-                     CODE_SIGNING_ALLOWED=NO \
-                     CODE_SIGNING_REQUIRED=NO \
-                     CODE_SIGN_IDENTITY="" \
+                     CODE_SIGNING_ALLOWED=YES \
+                     CODE_SIGNING_REQUIRED=YES \
+                     CODE_SIGN_IDENTITY="-" \
                      CODE_SIGN_ENTITLEMENTS="" \
                      PROVISIONING_PROFILE_SPECIFIER="" \
-                     AD_HOC_CODE_SIGNING_ALLOWED=YES \
                      DEVELOPMENT_TEAM="" \
                      CODE_SIGN_STYLE=Manual \
                      ENABLE_USER_SCRIPT_SANDBOXING=NO \
@@ -49,7 +48,7 @@ jobs:
         if: failure()
         run: |
           echo "=== BUILD ERROR DETAILS ==="
-          find samples/CameraAccess/build -name "*.xcresult" -exec xcrun xcresulttool get --format json --path {} \; 2>/dev/null | grep -i "error" | head -n 30 || true
+          find samples/CameraAccess/build -name "*.xcresult" -exec xcrun xcresulttool get --format json --path {} \; 2>/dev/null | grep -i "error" | head -n 50 || true
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
