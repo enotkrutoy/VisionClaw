@@ -13,49 +13,59 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Create Global Override xcconfig
+      - name: Create Self-Signed Developer Certificate
         run: |
-          cd samples/CameraAccess
-          cat << 'EOF' > override.xcconfig
-          CODE_SIGNING_ALLOWED = NO
-          CODE_SIGNING_REQUIRED = NO
-          AD_HOC_CODE_SIGNING_ALLOWED = NO
-          CODE_SIGN_IDENTITY = 
-          CODE_SIGN_ENTITLEMENTS = 
-          DEVELOPMENT_TEAM = 
-          PROVISIONING_PROFILE_SPECIFIER = 
-          ENTITLEMENTS_REQUIRED = NO
-          ENABLE_USER_SCRIPT_SANDBOXING = NO
-          VALIDATE_WORKSPACE = NO
-          EOF
+          # 1. Создаем и открываем временную связку ключей
+          KEYCHAIN_PATH=$HOME/Library/Keychains/build.keychain-db
+          KEYCHAIN_PASS="buildpassword123"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -t 3600 -u "$KEYCHAIN_PATH"
+
+          # 2. Генерируем приватный ключ и самоподписанный сертификат разработки iOS
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout ci_cert.key -out ci_cert.crt \
+            -subj "/CN=iOS Developer: VisionClaw CI/O=VisionClaw/C=US" -days 365
+
+          openssl pkcs12 -export -out ci_cert.p12 -inkey ci_cert.key -in ci_cert.crt \
+            -passout pass:"$KEYCHAIN_PASS"
+
+          # 3. Импортируем сертификат в Keychain и разрешаем доступ утилите codesign
+          security import ci_cert.p12 -k "$KEYCHAIN_PATH" -P "$KEYCHAIN_PASS" -A
+          security set-key-partition-list -S apple-tool-default:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
 
       - name: Resolve Swift Packages
         run: |
           cd samples/CameraAccess
           xcodebuild -resolvePackageDependencies -project CameraAccess.xcodeproj -scheme CameraAccess
 
-      - name: Build Xcode Project (Bypass Codesign)
+      - name: Build Xcode Project
         run: |
           cd samples/CameraAccess
           xcodebuild clean build \
                      -project CameraAccess.xcodeproj \
                      -scheme CameraAccess \
                      -sdk iphoneos \
+                     -destination 'generic/platform=iOS' \
                      -configuration Release \
                      -arch arm64 \
-                     -xcconfig override.xcconfig \
-                     CODESIGN=/usr/bin/true \
-                     CODESIGN_ALLOCATE=/usr/bin/true \
+                     CODE_SIGN_STYLE=Manual \
+                     CODE_SIGN_IDENTITY="iOS Developer: VisionClaw CI" \
+                     CODE_SIGNING_REQUIRED=YES \
+                     CODE_SIGNING_ALLOWED=YES \
+                     PROVISIONING_PROFILE_SPECIFIER="" \
+                     DEVELOPMENT_TEAM="" \
+                     ENABLE_USER_SCRIPT_SANDBOXING=NO \
                      -derivedDataPath build
 
       - name: Create IPA Package
         run: |
           cd samples/CameraAccess
           mkdir -p Payload
-          # Динамический поиск .app файла, чтобы избежать ошибок путей
           APP_PATH=$(find build/Build/Products -name "*.app" | head -n 1)
           if [ -z "$APP_PATH" ]; then
-            echo "App bundle not found!"
+            echo "Error: .app bundle not found after build!"
             exit 1
           fi
           cp -r "$APP_PATH" Payload/
@@ -64,8 +74,8 @@ jobs:
       - name: Show Detailed Log on Failure
         if: failure()
         run: |
-          echo "=== DETAILED XCODEBUILD LOG ==="
-          find samples/CameraAccess/build -name "*.xcresult" -exec xcrun xcresulttool get --format json --path {} \; 2>/dev/null | grep -i "error" | head -n 100 || true
+          echo "=== BUILD ERROR LOG ==="
+          find samples/CameraAccess/build -name "*.xcresult" -exec xcrun xcresulttool get --format json --path {} \; 2>/dev/null | grep -i "error" | head -n 50 || true
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
