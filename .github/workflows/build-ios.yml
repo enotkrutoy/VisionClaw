@@ -13,43 +13,59 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Create Global Override xcconfig
+        run: |
+          cd samples/CameraAccess
+          cat << 'EOF' > override.xcconfig
+          CODE_SIGNING_ALLOWED = NO
+          CODE_SIGNING_REQUIRED = NO
+          AD_HOC_CODE_SIGNING_ALLOWED = NO
+          CODE_SIGN_IDENTITY = 
+          CODE_SIGN_ENTITLEMENTS = 
+          DEVELOPMENT_TEAM = 
+          PROVISIONING_PROFILE_SPECIFIER = 
+          ENTITLEMENTS_REQUIRED = NO
+          ENABLE_USER_SCRIPT_SANDBOXING = NO
+          VALIDATE_WORKSPACE = NO
+          EOF
+
       - name: Resolve Swift Packages
         run: |
           cd samples/CameraAccess
           xcodebuild -resolvePackageDependencies -project CameraAccess.xcodeproj -scheme CameraAccess
 
-      - name: Clean and Build Xcode Project
+      - name: Build Xcode Project (Bypass Codesign)
         run: |
           cd samples/CameraAccess
           xcodebuild clean build \
                      -project CameraAccess.xcodeproj \
                      -scheme CameraAccess \
                      -sdk iphoneos \
-                     -destination 'generic/platform=iOS' \
                      -configuration Release \
-                     CODE_SIGNING_ALLOWED=NO \
-                     CODE_SIGNING_REQUIRED=NO \
-                     CODE_SIGN_IDENTITY="" \
-                     CODE_SIGN_ENTITLEMENTS="" \
-                     PROVISIONING_PROFILE_SPECIFIER="" \
-                     DEVELOPMENT_TEAM="" \
-                     CODE_SIGN_STYLE=Manual \
-                     ENABLE_USER_SCRIPT_SANDBOXING=NO \
-                     ENTITLEMENTS_REQUIRED=NO \
+                     -arch arm64 \
+                     -xcconfig override.xcconfig \
+                     CODESIGN=/usr/bin/true \
+                     CODESIGN_ALLOCATE=/usr/bin/true \
                      -derivedDataPath build
 
       - name: Create IPA Package
         run: |
           cd samples/CameraAccess
           mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/*.app Payload/
+          # Динамический поиск .app файла, чтобы избежать ошибок путей
+          APP_PATH=$(find build/Build/Products -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "App bundle not found!"
+            exit 1
+          fi
+          cp -r "$APP_PATH" Payload/
           zip -r CameraAccess.ipa Payload
 
       - name: Show Detailed Log on Failure
         if: failure()
         run: |
-          echo "=== BUILD ERROR DETAILS ==="
-          find samples/CameraAccess/build -name "*.xcresult" -exec xcrun xcresulttool get --format json --path {} \; 2>/dev/null | grep -i "error" | head -n 50 || true
+          echo "=== DETAILED XCODEBUILD LOG ==="
+          find samples/CameraAccess/build -name "*.xcresult" -exec xcrun xcresulttool get --format json --path {} \; 2>/dev/null | grep -i "error" | head -n 100 || true
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
