@@ -1,0 +1,585 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//
+// StreamSessionViewModel.swift
+//
+// Core view model demonstrating video streaming from Meta wearable devices using the DAT SDK.
+// This class showcases the key streaming patterns: device selection, session management,
+// video frame handling, photo capture, and error handling.
+//
+// DAT 0.9 model: a DeviceSession is created and started first, then a Camera is
+// added to it and its Stream carries the video. The old single StreamSession
+// object (0.4) is gone; this view model keeps the same public surface so the
+// views and the LiveKit bridge are unchanged.
+//
+
+import AVFoundation
+import CoreImage
+import CoreMedia
+import CoreVideo
+import MWDATCamera
+import MWDATCore
+import SwiftUI
+import VideoToolbox
+
+enum StreamingStatus: Equatable {
+  case streaming
+  case waiting
+  case stopped
+}
+
+enum StreamingMode {
+  case glasses
+  case iPhone
+}
+
+@MainActor
+class StreamSessionViewModel: ObservableObject {
+  @Published var currentVideoFrame: UIImage?
+  @Published var hasReceivedFirstFrame: Bool = false
+  @Published var streamingStatus: StreamingStatus = .stopped
+  @Published var showError: Bool = false
+  @Published var errorMessage: String = ""
+  @Published var hasActiveDevice: Bool = false
+  @Published var streamingMode: StreamingMode = .glasses
+  @Published var selectedResolution: StreamingResolution = .high
+
+  var isStreaming: Bool {
+    streamingStatus != .stopped
+  }
+
+  // Ask the SDK rather than asserting. These were hardcoded strings, so every
+  // "requested 720x1280" we logged was an assumption about what .high means on
+  // this SDK and device, never a reading.
+  var resolutionLabel: String {
+    let size = selectedResolution.videoFrameSize
+    return "\(size.width)x\(size.height)"
+  }
+
+  // Photo capture properties
+  @Published var capturedPhoto: UIImage?
+  @Published var showPhotoPreview: Bool = false
+
+  // DAT 0.9 splits the old StreamSession into a DeviceSession (the connection to
+  // the glasses) and a Camera whose `stream` carries the video. Both are nil when
+  // the Wearables SDK is unavailable (simulator, or a build without glasses); the
+  // iPhone camera path never touches them.
+  private var deviceSession: DeviceSession?
+  private var camera: Camera?
+  // Set when the user asked to stream; the session state observer starts the
+  // camera as soon as the session reaches `.started`, since a camera can only be
+  // added to a started session.
+  private var wantsStream: Bool = false
+  // True while the user is in a glasses call (set on start, cleared on hang-up).
+  // Governs auto-reconnect: a mid-call stream/session drop should recover the
+  // glasses stream, not tear the whole call down (DaeHo's "stuck / reconnecting").
+  private var userWantsCall = false
+  private var reconnectTask: Task<Void, Never>?
+  // Listener tokens are used to manage DAT SDK event subscriptions
+  private var sessionStateListenerToken: AnyListenerToken?
+  private var stateListenerToken: AnyListenerToken?
+  private var videoFrameListenerToken: AnyListenerToken?
+  private var errorListenerToken: AnyListenerToken?
+  private var photoDataListenerToken: AnyListenerToken?
+  private let wearables: WearablesInterface?
+  private let deviceSelector: AutoDeviceSelector?
+  private var deviceMonitorTask: Task<Void, Never>?
+  // CPU-based CIContext for rendering decoded pixel buffers in background
+  private let cpuCIContext = CIContext(options: [.useSoftwareRenderer: true])
+  // Decompresses HEVC/H.264 samples into pixel buffers. The SDK returns
+  // compressed samples for the hvc1 codec, and for raw once backgrounded.
+  private let videoDecoder = VideoDecoder()
+  private var decodedFrameCount = 0
+  private var bgDiagLogged = false
+  // Throttles the (redundant, expensive) UIImage preview so it can't saturate
+  // the main thread; the LiveKit feed itself is never throttled.
+  private var previewThrottle: Int = 0
+  // Requested glasses frame rate. ONLY 2, 7, 15, 24 and 30 are legal values
+  // (Meta's camera-streaming docs); anything else is snapped to a rung. We had
+  // asked for 5 and then 3, which is why the delivered rate sat at ~2fps no
+  // matter what we changed. That was our request being rounded down, NOT the
+  // link starving, so it was never evidence about available bandwidth.
+  //
+  // 15. Meta's docs say the delivered image can look worse than the reported
+  // tier because per-frame compression adapts to the Bluetooth Classic budget,
+  // and that asking for less yields higher visual quality per frame. At 30 the
+  // link opened at 720x1280, then laddered to 504x896 and spent the remaining
+  // bandwidth on frame count rather than frame quality. 15 is the rung below:
+  // still a large enough request to negotiate up, but leaving more bits per
+  // frame, which is what a vision model reading stills actually wants. It also
+  // halves the software decode cost while the screen is locked.
+  private let requestedFrameRate: UInt = 15
+  private var fpsCount: Int = 0
+  private var fpsWindowStart: Date = .now
+  // One-shot guards so the compressed-frame path reports itself once, not per frame.
+  private var loggedUndecodedFrame = false
+  private var loggedDecodeError = false
+
+  init(wearables: WearablesInterface?) {
+    self.wearables = wearables
+
+    if let wearables {
+      // Let the SDK auto-select from available devices
+      let selector = AutoDeviceSelector(wearables: wearables)
+      self.deviceSelector = selector
+
+      // Monitor device availability
+      deviceMonitorTask = Task { @MainActor in
+        for await device in selector.activeDeviceStream() {
+          self.hasActiveDevice = device != nil
+        }
+      }
+    } else {
+      self.deviceSelector = nil
+    }
+
+    setupVideoDecoder()
+  }
+
+  /// Bridge to the LiveKit call: every decoded glasses frame is also handed
+  /// here, so the room publishes exactly what the glasses see.
+  var onDecodedFrame: ((CVPixelBuffer) -> Void)?
+
+  private func setupVideoDecoder() {
+    videoDecoder.setFrameCallback { [weak self] decodedFrame in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        let pixelBuffer = decodedFrame.pixelBuffer
+        // Straight into the room. Deliberately no CPU CIContext render here:
+        // with a compressed codec this is the hot path for every frame, and a
+        // per-frame software image conversion is what saturated the main thread
+        // before (the freeze, then the watchdog kill).
+        self.onDecodedFrame?(pixelBuffer)
+        self.decodedFrameCount &+= 1
+        // Every ~5s at 2fps, tagged with app state, so a locked-screen run
+        // shows whether VideoToolbox keeps decoding while backgrounded.
+        if self.decodedFrameCount <= 3 || self.decodedFrameCount % 10 == 0 {
+          NSLog("[Stream] decoded frame #%d (%dx%d) app=%@", self.decodedFrameCount,
+                CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
+                UIApplication.shared.applicationState == .background ? "background" : "foreground")
+        }
+      }
+    }
+  }
+
+  /// Store the resolution to use for the next stream. In 0.9 the config is applied
+  /// when the camera is added, so this only takes effect when not streaming.
+  func updateResolution(_ resolution: StreamingResolution) {
+    guard !isStreaming else { return }
+    selectedResolution = resolution
+    NSLog("[Stream] Resolution changed to %@", resolutionLabel)
+  }
+
+  private func streamConfig() -> StreamConfiguration {
+    // 720x1280 (.high) for the most detail the glasses will stream. A low frame
+    // rate trades motion smoothness for sharper frames on the link, which suits
+    // a vision model that reads stills.
+    //
+    // hvc1 (HEVC) rather than raw: raw 720x1280 NV12 is ~1.38MB per frame
+    // (~33Mbps at 3fps), far more than the glasses link carries, so the SDK
+    // laddered the source down to 504x896 and still only delivered ~2fps no
+    // matter what frame rate was requested. HEVC is roughly 10-30x smaller, so
+    // the top tier should fit. VideoFrame exposes the same sampleBuffer either
+    // way; if these arrive still-compressed the frame handler logs it once and
+    // no video flows, which is the signal to go back to .raw.
+    // What every tier actually resolves to on this SDK and device. If .high is
+    // not 720x1280 here, then 504x896 was the ceiling all along and there was
+    // never a step-down to chase.
+    NSLog("[Stream] SDK resolution tiers: %@ | requesting %@ @ %u fps, codec hvc1",
+          StreamingResolution.allCases
+            .map { "\($0)=\($0.videoFrameSize.width)x\($0.videoFrameSize.height)" }
+            .joined(separator: " "),
+          resolutionLabel, requestedFrameRate)
+    return StreamConfiguration(
+      videoCodec: VideoCodec.hvc1,
+      resolution: selectedResolution,
+      frameRate: requestedFrameRate)
+  }
+
+  private func observeSession(_ session: DeviceSession) {
+    sessionStateListenerToken = session.statePublisher.listen { [weak self] state in
+      Task { @MainActor [weak self] in
+        self?.handleSessionState(state)
+      }
+    }
+  }
+
+  private func handleSessionState(_ state: DeviceSessionState) {
+    switch state {
+    case .started:
+      // A camera can only be added to a started session; start it now if the user
+      // asked to stream and one isn't already attached.
+      if wantsStream, camera == nil {
+        beginStream()
+      }
+    case .idle, .stopped:
+      camera = nil
+      deviceSession = nil
+      currentVideoFrame = nil
+      if userWantsCall {
+        // Stream stopped mid-call, almost always because the glasses came off
+        // or folded (their camera cuts when doffed). Keep the call alive and
+        // keep retrying, but the actionable prompt is "put them on," not a
+        // "reconnecting" message that implies the link itself dropped.
+        glassesIssue = nil
+        streamingStatus = .waiting
+        scheduleReconnect()
+      } else {
+        wantsStream = false
+        streamingStatus = .stopped
+      }
+    case .starting, .stopping:
+      streamingStatus = .waiting
+    case .paused:
+      streamingStatus = .waiting
+    }
+  }
+
+  /// Adds a camera to the started session and wires its stream's listeners, then
+  /// starts it. The video frames flow through `camera.stream.videoFramePublisher`.
+  private func beginStream() {
+    guard let session = deviceSession, session.state == .started else { return }
+    do {
+      guard let newCamera = try session.addCamera(config: streamConfig()) else {
+        glassesIssue = .reconnecting
+        return
+      }
+      camera = newCamera
+      attachStreamListeners(to: newCamera.stream)
+      // Subscribe before start() so no initial state transitions are missed.
+      // Meta's ordering rule: the glasses HFP microphone must be configured and
+      // its route settled BEFORE the camera stream starts, or the audio route
+      // can fail silently and the call comes out of the phone instead.
+      Task { @MainActor [weak self] in
+        await self?.prepareGlassesAudioRoute()
+        newCamera.stream.start()
+      }
+    } catch {
+      camera = nil
+      // Sleeping or out-of-range glasses are a wait, not a hard error.
+      glassesIssue = mapDeviceSessionError(error)
+    }
+  }
+
+  /// Selects the glasses HFP microphone and lets the route settle before the
+  /// camera stream starts, which is the order Meta's DAT guidance requires.
+  /// Best effort by design: the audio session category and activation belong to
+  /// LiveKit's AudioManager, which only comes up once the call starts, so this
+  /// pre-selects the input and the call path re-checks it afterwards. Skipping
+  /// an input that is already routed is deliberate, since re-selecting a live
+  /// input is the route churn that has made the glasses go deaf before.
+  private func prepareGlassesAudioRoute() async {
+    let session = AVAudioSession.sharedInstance()
+    guard let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) else {
+      NSLog("[Audio] no glasses HFP input yet; starting stream without it")
+      return
+    }
+    if session.currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) {
+      NSLog("[Audio] glasses HFP already routed before stream start")
+      return
+    }
+    try? session.setPreferredInput(hfp)
+    try? await Task.sleep(nanoseconds: 1_500_000_000)
+    let routed = session.currentRoute.inputs.contains { $0.portType == .bluetoothHFP }
+    NSLog("[Audio] pre-stream HFP select, routed=%@", routed ? "yes" : "no")
+  }
+
+  private func attachStreamListeners(to stream: MWDATCamera.Stream) {
+    // Subscribe to stream state changes using the DAT SDK listener pattern
+    stateListenerToken = stream.statePublisher.listen { [weak self] state in
+      Task { @MainActor [weak self] in
+        self?.updateStatusFromState(state)
+      }
+    }
+
+    // Subscribe to video frames from the device camera
+    // This callback fires whether the app is in the foreground or background,
+    // enabling continuous streaming even when the screen is locked.
+    videoFrameListenerToken = stream.videoFramePublisher.listen { [weak self] videoFrame in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+
+        // Feed LiveKit every frame -- this is the call's actual video and must
+        // run at full frame rate. A decoded frame carries the pixel buffer
+        // directly; hand it straight to the room in both foreground and
+        // background so the agent keeps seeing the glasses with the screen off.
+        let pixelBuffer = CMSampleBufferGetImageBuffer(videoFrame.sampleBuffer)
+        if let pixelBuffer {
+          self.onDecodedFrame?(pixelBuffer)
+        } else {
+          // Compressed sample. The SDK hands these back for hvc1, and for raw
+          // too once the app is backgrounded. VideoDecoder turns them into
+          // pixel buffers and its callback forwards them on from there.
+          if !self.loggedUndecodedFrame {
+            self.loggedUndecodedFrame = true
+            NSLog("[Stream] compressed frames, decoding via VideoDecoder")
+          }
+          do {
+            try self.videoDecoder.decode(videoFrame.sampleBuffer)
+          } catch {
+            if !self.loggedDecodeError {
+              self.loggedDecodeError = true
+              NSLog("[Stream] frame decode failed: %@ -- revert videoCodec to .raw",
+                    String(describing: error))
+            }
+          }
+        }
+        if !self.hasReceivedFirstFrame {
+          self.hasReceivedFirstFrame = true
+          self.fpsWindowStart = .now
+          if let pb = pixelBuffer {
+            NSLog("[Stream] first glasses frame %dx%d (config %@)",
+                  CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb), self.resolutionLabel)
+          }
+        }
+        // Report the actual delivered frame rate so we can see whether the
+        // glasses honor the requested fps or clamp it to their floor.
+        self.fpsCount += 1
+        let fpsElapsed = Date.now.timeIntervalSince(self.fpsWindowStart)
+        if fpsElapsed >= 3 {
+          var srcDims = "?x?"
+          if let pb = CMSampleBufferGetImageBuffer(videoFrame.sampleBuffer) {
+            srcDims = "\(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb))"
+          }
+          // Source == what the preview renders and what LiveKit is fed. If it
+          // is below the requested label, the Bluetooth link auto-laddered the
+          // glasses resolution down (not the phone-to-server leg).
+          NSLog("[Stream] delivered %.1f fps (requested %u), source %@ (requested %@) app=%@",
+                Double(self.fpsCount) / fpsElapsed, self.requestedFrameRate, srcDims, self.resolutionLabel,
+                UIApplication.shared.applicationState == .background ? "background" : "foreground")
+          self.fpsCount = 0
+          self.fpsWindowStart = .now
+        }
+        // The UIImage preview is only for the legacy StreamView; LiveKit renders
+        // the track itself during a call, so makeUIImage (a GPU->CPU render) is
+        // redundant here. Throttle it to a few fps and skip it while backgrounded
+        // so 24fps of it can't saturate the main thread and trip the watchdog
+        // (the freeze then SIGKILL).
+        self.previewThrottle &+= 1
+        if self.previewThrottle % 6 == 0,
+           UIApplication.shared.applicationState != .background,
+           let image = videoFrame.makeUIImage() {
+          self.currentVideoFrame = image
+        }
+      }
+    }
+
+    // Subscribe to streaming errors
+    errorListenerToken = stream.errorPublisher.listen { [weak self] error in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        // One voice: glasses-state conditions render as placeholder text on
+        // the call screen, never as alert dialogs. Sleeping/absent glasses are
+        // a plain wait; everything else maps to a typed issue.
+        switch error {
+        case .deviceNotConnected, .deviceNotFound:
+          self.glassesIssue = nil
+        case .hingesClosed:
+          self.glassesIssue = .hingesClosed
+        case .permissionDenied:
+          self.glassesIssue = .permissionNeeded
+        default:
+          self.glassesIssue = .reconnecting
+        }
+      }
+    }
+
+    // Do not seed from stream.state here: a freshly created camera's stream is
+    // .stopped until start(), and seeding that would flip streamingStatus to
+    // .stopped mid-startup. The statePublisher above delivers the real
+    // transitions (.starting -> .streaming) right after start().
+
+    // Subscribe to photo capture events
+    photoDataListenerToken = stream.photoDataPublisher.listen { [weak self] photoData in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        guard let uiImage = UIImage(data: photoData.data) else { return }
+        // Photos travel a separate path from the video stream (the SDK pauses
+        // streaming during capture so the still gets the whole link), so they
+        // are not bound by the StreamingResolution tier. If this prints much
+        // larger than the stream, routing the model's detail requests through
+        // capturePhoto beats fighting the stream tier.
+        NSLog("[Photo] captured %.0fx%.0f (%d KB) -- stream tier is %@",
+              uiImage.size.width * uiImage.scale, uiImage.size.height * uiImage.scale,
+              photoData.data.count / 1024, self.resolutionLabel)
+        self.capturedPhoto = uiImage
+        self.showPhotoPreview = true
+      }
+    }
+  }
+
+  /// Glasses-state conditions the call screen's placeholder can name --
+  /// the app's own voice, replacing the sample's alert dialogs.
+  enum GlassesIssue: Equatable {
+    case sdkUnavailable
+    case permissionNeeded
+    case hingesClosed
+    case reconnecting
+  }
+
+  @Published var glassesIssue: GlassesIssue?
+
+  func handleStartStreaming() async {
+    glassesIssue = nil
+    guard let wearables else {
+      glassesIssue = .sdkUnavailable
+      return
+    }
+    userWantsCall = true
+    reconnectTask?.cancel()
+    let permission = Permission.camera
+    do {
+      let status = try await wearables.checkPermissionStatus(permission)
+      if status == .granted {
+        await startSession()
+        return
+      }
+      let requestStatus = try await wearables.requestPermission(permission)
+      if requestStatus == .granted {
+        await startSession()
+        return
+      }
+      glassesIssue = .permissionNeeded
+    } catch {
+      // Sleeping or out-of-range glasses are a wait state, not an error.
+      let text = String(describing: error).lowercased()
+      if text.contains("powered off") || text.contains("disconnected") || text.contains("no device") {
+        NSLog("[Stream] glasses unavailable, waiting: %@", String(describing: error))
+        glassesIssue = nil
+      } else {
+        glassesIssue = .reconnecting
+      }
+    }
+  }
+
+  /// Creates and starts the DeviceSession, then streams once it reaches `.started`.
+  func startSession() async {
+    guard let wearables, let deviceSelector else {
+      glassesIssue = .sdkUnavailable
+      return
+    }
+    guard deviceSession == nil else {
+      // Session already up; just (re)start the camera if needed.
+      wantsStream = true
+      if deviceSession?.state == .started, camera == nil {
+        beginStream()
+      }
+      return
+    }
+    wantsStream = true
+    do {
+      let session = try wearables.createSession(deviceSelector: deviceSelector)
+      deviceSession = session
+      // Subscribe before start() so no initial state transitions are missed.
+      observeSession(session)
+      streamingStatus = .waiting
+      try session.start()
+    } catch {
+      glassesIssue = mapDeviceSessionError(error)
+      deviceSession = nil
+      if userWantsCall {
+        // Transient create/start failure during a call: keep the call alive and
+        // keep retrying instead of ending it.
+        streamingStatus = .waiting
+        scheduleReconnect()
+      } else {
+        wantsStream = false
+        streamingStatus = .stopped
+      }
+    }
+  }
+
+  private func mapDeviceSessionError(_ error: DeviceSessionError) -> GlassesIssue? {
+    switch error {
+    case .noEligibleDevice:
+      // No glasses in range/awake: a plain wait, not a hard error.
+      return nil
+    default:
+      return .reconnecting
+    }
+  }
+
+  private func showError(_ message: String) {
+    errorMessage = message
+    showError = true
+  }
+
+  /// Stops the camera stream and ends the device session. `stop()` is terminal
+  /// and cascades to the stream; the state observers clear our references.
+  func stopSession() async {
+    // User hang-up: stop recovering, then tear down.
+    userWantsCall = false
+    reconnectTask?.cancel()
+    reconnectTask = nil
+    wantsStream = false
+    if let camera {
+      camera.stop()
+    }
+    deviceSession?.stop()
+  }
+
+  /// Recover a dropped glasses stream while the user is still in a call, without
+  /// killing the LiveKit call (audio keeps going). Retries on a slow cadence
+  /// until streaming resumes or the user hangs up.
+  private func scheduleReconnect() {
+    guard userWantsCall else { return }
+    reconnectTask?.cancel()
+    reconnectTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: 1_500_000_000)
+      guard let self, !Task.isCancelled, self.userWantsCall,
+            self.streamingStatus != .streaming else { return }
+      NSLog("[Stream] auto-reconnect")
+      if self.deviceSession == nil {
+        await self.startSession()
+      } else if self.camera == nil, self.deviceSession?.state == .started {
+        self.beginStream()
+      }
+      // Keep trying until frames flow again or the user hangs up.
+      if self.streamingStatus != .streaming, self.userWantsCall {
+        self.scheduleReconnect()
+      }
+    }
+  }
+
+  func dismissError() {
+    showError = false
+    errorMessage = ""
+  }
+
+  func capturePhoto() {
+    _ = camera?.stream.capturePhoto(format: .jpeg)
+  }
+
+  func dismissPhotoPreview() {
+    showPhotoPreview = false
+    capturedPhoto = nil
+  }
+
+  private func updateStatusFromState(_ state: StreamState) {
+    switch state {
+    case .stopped:
+      currentVideoFrame = nil
+      if userWantsCall {
+        // Stream dropped mid-call, usually the glasses coming off or folding.
+        // Keep the call alive and keep retrying; prompt the user to put them
+        // on rather than showing a "reconnecting" message.
+        glassesIssue = nil
+        streamingStatus = .waiting
+        scheduleReconnect()
+      } else {
+        streamingStatus = .stopped
+      }
+    case .waitingForDevice, .starting, .stopping, .paused:
+      streamingStatus = .waiting
+    case .streaming:
+      streamingStatus = .streaming
+      glassesIssue = nil
+    }
+  }
+}
