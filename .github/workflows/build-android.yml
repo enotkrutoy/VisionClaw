@@ -1,0 +1,44 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Configure GitHub Packages Auth
+        run: |
+          cd samples/CameraAccessAndroid
+          # Подставляем ранее созданный секретный токен
+          echo "github_token=${{ secrets.PACKAGES_PAT }}" > local.properties
+
+      - name: Create Secrets.kt mockup
+        run: |
+          cd samples/CameraAccessAndroid/app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/
+          cp Secrets.kt.example Secrets.kt
+
+      - name: Build Debug APK
+        run: |
+          cd samples/CameraAccessAndroid
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VisionClaw-Android-APK
+          path: samples/CameraAccessAndroid/app/build/outputs/apk/debug/*.apk
