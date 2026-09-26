@@ -23,7 +23,6 @@ jobs:
       - name: Configure GitHub Packages Auth
         run: |
           cd samples/CameraAccessAndroid
-          # Подставляем ранее созданный секретный токен
           echo "github_token=${{ secrets.PACKAGES_PAT }}" > local.properties
 
       - name: Create Secrets.kt mockup
@@ -31,11 +30,17 @@ jobs:
           cd samples/CameraAccessAndroid/app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/
           cp Secrets.kt.example Secrets.kt
 
-      - name: Build Debug APK
+      - name: Fix gradle.properties and Build Debug APK
         run: |
           cd samples/CameraAccessAndroid
+          # Удаляем ошибочный путь к Java для macOS, если он есть в файле
+          if [ -f "gradle.properties" ]; then
+            sed -i '/org.gradle.java.home/d' gradle.properties
+          fi
+          
           chmod +x gradlew
-          ./gradlew assembleDebug
+          # Принудительно передаем правильный путь из виртуальной машины
+          ./gradlew assembleDebug -Dorg.gradle.java.home="$JAVA_HOME"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
